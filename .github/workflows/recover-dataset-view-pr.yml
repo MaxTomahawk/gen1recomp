@@ -30,6 +30,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y luajit lua5.4 liblua5.4-dev luarocks
           sudo luarocks install luacheck || sudo apt-get install -y lua-check
+          python3 -m pip install --upgrade pillow
           luajit -v
           luacheck --version
 
@@ -143,6 +144,24 @@ jobs:
 
           python3 - <<'PY'
           from pathlib import Path
+          path = Path('tests/modkit/cases/dataset_views.lua')
+          text = path.read_text()
+          versions_old = '{ "red", "blue", "yellow", "gold", "silver" }'
+          versions_new = '{ "red", "blue", "yellow", "gold", "silver", "crystal" }'
+          assert text.count(versions_old) >= 3
+          text = text.replace(versions_old, versions_new)
+          text = text.replace(
+              '(version == "gold" or version == "silver") and 2 or 1,',
+              'GameVersion.generation(version),')
+          assert 'mod.datasets:open("crystal")' in text
+          text = text.replace(
+              'mod.datasets:open("crystal")',
+              'mod.datasets:open("missing-version")', 1)
+          path.write_text(text)
+          PY
+
+          python3 - <<'PY'
+          from pathlib import Path
           path = Path('docs/rfcs/0015-imported-dataset-views.md')
           text = path.read_text()
           text = text.replace(
@@ -172,6 +191,8 @@ jobs:
           luajit tests/engine/generated_data_decoder_test.lua
           luajit tests/engine/rom_importer_source_tree_test.lua
           luajit tests/engine/trade_art_import.lua
+          luajit tests/modkit/cases/dataset_views.lua
+          luajit tests/modkit/cases/dataset_views_nontermination.lua
 
       - name: Full ROM-free regression suite
         run: ./scripts/test.sh
