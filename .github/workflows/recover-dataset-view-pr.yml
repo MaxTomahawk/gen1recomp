@@ -1,0 +1,205 @@
+name: recover dataset view pr
+
+on:
+  push:
+    branches:
+      - adaptive-trainers/recover-dataset-view-pr
+
+permissions:
+  contents: write
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    env:
+      TARGET_BRANCH: adaptive-trainers/dataset-view-api
+      EXPECTED_HEAD: 68fc01dd1cedcd064debf3264bd95f5d091be467
+      EXPECTED_UPSTREAM: ba201aa4adb648fadbadeef84f6d47435ca3d2e6
+      MERGED_CACHE_BLOB: d9d0cb52229bf83e6d003e67357350cbccf1ffc0
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out target PR branch
+        uses: actions/checkout@v7
+        with:
+          ref: adaptive-trainers/dataset-view-api
+          fetch-depth: 0
+
+      - name: Install test and lint tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y luajit lua5.4 liblua5.4-dev luarocks
+          sudo luarocks install luacheck || sudo apt-get install -y lua-check
+          luajit -v
+          luacheck --version
+
+      - name: Merge current upstream dev and resolve semantic conflicts
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          git config user.name "MaxTomahawk"
+          git config user.email "maxtomahawk@example.com"
+          git remote add upstream https://github.com/bryanthaboi/gen1recomp.git
+          git fetch upstream dev
+          test "$(git rev-parse upstream/dev)" = "$EXPECTED_UPSTREAM"
+
+          cp docs/modding.md /tmp/modding-ours.md
+
+          set +e
+          git merge --no-ff --no-commit upstream/dev
+          merge_status=$?
+          set -e
+          if [ "$merge_status" -ne 0 ] && [ "$merge_status" -ne 1 ]; then
+            exit "$merge_status"
+          fi
+
+          unexpected=0
+          while IFS= read -r path; do
+            [ -z "$path" ] && continue
+            case "$path" in
+              docs/modding.md|src/core/Game2.lua|src/import/CacheContract.lua|src/import/RomImporter.lua|src/mods/Loader.lua|tests/engine/rom_importer_source_tree_test.lua|tests/engine/trade_art_import.lua)
+                ;;
+              *)
+                echo "unexpected merge conflict: $path" >&2
+                unexpected=1
+                ;;
+            esac
+          done < <(git diff --name-only --diff-filter=U)
+          test "$unexpected" -eq 0
+
+          # Redundant PR rewrites lose to current upstream. Their behavior is
+          # already covered by the engine-owned cache contract / Gen2 boot.
+          git checkout upstream/dev -- \
+            src/core/Game2.lua \
+            src/import/RomImporter.lua \
+            tests/engine/rom_importer_source_tree_test.lua \
+            tests/engine/trade_art_import.lua
+
+          # Current upstream docs are authoritative; splice only the additive
+          # imported-dataset section from the PR into that current document.
+          git checkout upstream/dev -- docs/modding.md
+          python3 - <<'PY'
+          from pathlib import Path
+          ours = Path('/tmp/modding-ours.md').read_text()
+          path = Path('docs/modding.md')
+          current = path.read_text()
+          start = ours.index('## Imported version datasets\n')
+          end = ours.index('## Editing maps in Tiled', start)
+          section = ours[start:end]
+          if '## Imported version datasets\n' not in current:
+              marker = '## Editing maps in Tiled'
+              assert current.count(marker) == 1
+              current = current.replace(marker, section + marker, 1)
+          path.write_text(current)
+          PY
+
+          # Use the reviewed semantic merge of current CacheContract: retain
+          # v10/revision/Crystal/publication behavior and add read-only inspect.
+          gh api "repos/${GITHUB_REPOSITORY}/git/blobs/${MERGED_CACHE_BLOB}" \
+            --jq .content | tr -d '\n' | base64 -d > src/import/CacheContract.lua
+
+          # Loader is current upstream plus exactly one lazy public facade.
+          git checkout upstream/dev -- src/mods/Loader.lua
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/mods/Loader.lua')
+          text = path.read_text()
+          if '    datasets = {\n' not in text:
+              needle = '    manifest = Merge.deepCopy(mod.manifest),\n    content = {},\n'
+              assert text.count(needle) == 1
+              replacement = '''    manifest = Merge.deepCopy(mod.manifest),
+    datasets = {
+      open = function(_, version)
+        if not loader.datasetViews then
+          local DatasetViews = engineRequire("src.mods.DatasetViews")
+          loader.datasetViews = DatasetViews.new(loader.fs, engineRequire)
+        end
+        return loader.datasetViews:open(version)
+      end,
+    },
+    content = {},
+'''
+              text = text.replace(needle, replacement, 1)
+          path.write_text(text)
+          PY
+
+          # CacheContract is now the only cache-format authority.
+          if [ -e src/import/CacheFormat.lua ]; then
+            git rm -f src/import/CacheFormat.lua
+          fi
+          if grep -R --line-number --fixed-string 'CacheFormat' src tests; then
+            echo 'stale CacheFormat reference remains' >&2
+            exit 1
+          fi
+
+          # Fixture markers must respect version-specific formats (Crystal).
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('tests/modkit/dataset_view_fixture.lua')
+          text = path.read_text()
+          old = '''  files[prefix .. "rom-cache.complete"] =
+    "rom-cache-v10:" .. GameVersion.info(version).sha1
+'''
+          new = '''  files[prefix .. "rom-cache.complete"] =
+    CacheContract.markerFor(version)
+'''
+          assert text.count(old) == 1
+          path.write_text(text.replace(old, new, 1))
+          PY
+
+          # RFC follows the now-supported GameVersion catalog.
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('docs/rfcs/0015-imported-dataset-views.md')
+          text = path.read_text()
+          text = text.replace(
+              'Red, Blue, Yellow, Gold, and Silver keep their existing active data paths.',
+              'Red, Blue, Yellow, Gold, Silver, and Crystal keep their existing active data paths.')
+          text = text.replace(
+              'covers Red, Blue, Yellow, Gold, and Silver independently.',
+              'covers Red, Blue, Yellow, Gold, Silver, and Crystal independently.')
+          path.write_text(text)
+          PY
+
+          git add -A
+          if git diff --name-only --diff-filter=U | grep -q .; then
+            git diff --name-only --diff-filter=U
+            exit 1
+          fi
+          git diff --check --cached
+
+      - name: Focused dataset and cache regressions
+        run: |
+          set -euo pipefail
+          luajit tests/engine/rom_cache_contract_test.lua
+          luajit tests/engine/dataset_views_lazy_validation.lua
+          luajit tests/engine/dataset_views_no_mod_parity.lua
+          luajit tests/engine/dataset_views_warning_policy.lua
+          luajit tests/engine/gen2_reserved_metadata_ids.lua
+          luajit tests/engine/generated_data_decoder_test.lua
+          luajit tests/engine/rom_importer_source_tree_test.lua
+          luajit tests/engine/trade_art_import.lua
+
+      - name: Full ROM-free regression suite
+        run: ./scripts/test.sh
+
+      - name: Engine lint gate
+        run: ./scripts/lint.sh --gate
+
+      - name: Full lint report
+        continue-on-error: true
+        run: ./scripts/lint.sh
+
+      - name: Commit and fast-forward PR branch
+        run: |
+          set -euo pipefail
+          git add -A
+          git diff --check --cached
+          git status --short
+          git commit -m "Merge upstream dev into dataset view API"
+          parents="$(git show -s --format=%P HEAD)"
+          set -- $parents
+          test "$#" -eq 2
+          test "$1" = "$EXPECTED_HEAD"
+          test "$2" = "$EXPECTED_UPSTREAM"
+          git push origin "HEAD:${TARGET_BRANCH}"
