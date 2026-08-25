@@ -67,16 +67,12 @@ jobs:
           done < <(git diff --name-only --diff-filter=U)
           test "$unexpected" -eq 0
 
-          # Redundant PR rewrites lose to current upstream. Their behavior is
-          # already covered by the engine-owned cache contract / Gen2 boot.
           git checkout upstream/dev -- \
             src/core/Game2.lua \
             src/import/RomImporter.lua \
             tests/engine/rom_importer_source_tree_test.lua \
             tests/engine/trade_art_import.lua
 
-          # Current upstream docs are authoritative; splice only the additive
-          # imported-dataset section from the PR into that current document.
           git checkout upstream/dev -- docs/modding.md
           python3 - <<'PY'
           from pathlib import Path
@@ -93,12 +89,9 @@ jobs:
           path.write_text(current)
           PY
 
-          # Use the reviewed semantic merge of current CacheContract: retain
-          # v10/revision/Crystal/publication behavior and add read-only inspect.
           gh api "repos/${GITHUB_REPOSITORY}/git/blobs/${MERGED_CACHE_BLOB}" \
             --jq .content | tr -d '\n' | base64 -d > src/import/CacheContract.lua
 
-          # Loader is current upstream plus exactly one lazy public facade.
           git checkout upstream/dev -- src/mods/Loader.lua
           python3 - <<'PY'
           from pathlib import Path
@@ -107,23 +100,23 @@ jobs:
           if '    datasets = {\n' not in text:
               needle = '    manifest = Merge.deepCopy(mod.manifest),\n    content = {},\n'
               assert text.count(needle) == 1
-              replacement = '''    manifest = Merge.deepCopy(mod.manifest),
-    datasets = {
-      open = function(_, version)
-        if not loader.datasetViews then
-          local DatasetViews = engineRequire("src.mods.DatasetViews")
-          loader.datasetViews = DatasetViews.new(loader.fs, engineRequire)
-        end
-        return loader.datasetViews:open(version)
-      end,
-    },
-    content = {},
-'''
+              replacement = (
+                  '    manifest = Merge.deepCopy(mod.manifest),\n'
+                  '    datasets = {\n'
+                  '      open = function(_, version)\n'
+                  '        if not loader.datasetViews then\n'
+                  '          local DatasetViews = engineRequire("src.mods.DatasetViews")\n'
+                  '          loader.datasetViews = DatasetViews.new(loader.fs, engineRequire)\n'
+                  '        end\n'
+                  '        return loader.datasetViews:open(version)\n'
+                  '      end,\n'
+                  '    },\n'
+                  '    content = {},\n'
+              )
               text = text.replace(needle, replacement, 1)
           path.write_text(text)
           PY
 
-          # CacheContract is now the only cache-format authority.
           if [ -e src/import/CacheFormat.lua ]; then
             git rm -f src/import/CacheFormat.lua
           fi
@@ -132,22 +125,22 @@ jobs:
             exit 1
           fi
 
-          # Fixture markers must respect version-specific formats (Crystal).
           python3 - <<'PY'
           from pathlib import Path
           path = Path('tests/modkit/dataset_view_fixture.lua')
           text = path.read_text()
-          old = '''  files[prefix .. "rom-cache.complete"] =
-    "rom-cache-v10:" .. GameVersion.info(version).sha1
-'''
-          new = '''  files[prefix .. "rom-cache.complete"] =
-    CacheContract.markerFor(version)
-'''
+          old = (
+              '  files[prefix .. "rom-cache.complete"] =\n'
+              '    "rom-cache-v10:" .. GameVersion.info(version).sha1\n'
+          )
+          new = (
+              '  files[prefix .. "rom-cache.complete"] =\n'
+              '    CacheContract.markerFor(version)\n'
+          )
           assert text.count(old) == 1
           path.write_text(text.replace(old, new, 1))
           PY
 
-          # RFC follows the now-supported GameVersion catalog.
           python3 - <<'PY'
           from pathlib import Path
           path = Path('docs/rfcs/0015-imported-dataset-views.md')
